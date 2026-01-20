@@ -1,0 +1,8 @@
+{
+  "name": "AI Vision HUD System",
+  "description": "A futuristic AI Vision and Audio analysis dashboard simulating object tracking, gesture recognition, and voice commands.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ]
+}
