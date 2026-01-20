@@ -14,13 +14,20 @@ self.onmessage = async (event) => {
 
   if (type === 'load') {
     try {
+      postMessage({ type: 'progress', progress: 10, stage: 'TENSORFLOW' });
+
       // Force aggressive cleanup of WebGL textures
       tf.env().set('WEBGL_DELETE_TEXTURE_THRESHOLD', 0);
       
       await tf.setBackend('webgl');
       
+      postMessage({ type: 'progress', progress: 40, stage: 'COCO-SSD' });
+      
+      // Load SSD model with MobileNetV2 backbone (optimized for web)
       objectModel = await cocoSsd.load({ base: 'lite_mobilenet_v2' });
       
+      postMessage({ type: 'progress', progress: 70, stage: 'HAND-POSE' });
+
       const model = handPoseDetection.SupportedModels.MediaPipeHands;
       handModel = await handPoseDetection.createDetector(model, {
         runtime: 'tfjs', 
@@ -28,6 +35,7 @@ self.onmessage = async (event) => {
         maxHands: 2
       });
 
+      postMessage({ type: 'progress', progress: 100, stage: 'READY' });
       postMessage({ type: 'loaded' });
     } catch (e) {
       postMessage({ type: 'error', error: e.message });
@@ -45,7 +53,8 @@ self.onmessage = async (event) => {
           const tensor = tf.browser.fromPixels(imageBitmap);
           const predictions = [];
 
-          // Lowered threshold from 0.4 to 0.2 to catch more objects faster
+          // SSD Detection
+          // Threshold set to 0.2 to catch objects faster (labels will appear instantly in VisionSystem)
           const objects = await objectModel.detect(tensor, 20, 0.2);
           
           objects.forEach(obj => {
@@ -92,6 +101,7 @@ self.onmessage = async (event) => {
     if (imageBitmap) imageBitmap.close();
     
     if (result) {
+        // Send results back to main thread
         postMessage({ type: 'result', predictions: result, id, scaleFactor });
     }
   }

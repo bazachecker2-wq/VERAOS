@@ -8,7 +8,8 @@ import { PermissionGate } from './components/PermissionGate';
 import { BootSequence } from './components/BootSequence';
 import { TrackedObject, TranscriptItem, SystemStatus, LogEntry, ViewMode, ConnectedUser, AvatarAction, AiAnnotation, ZoomState, AnalysisMode, CameraDevice, TooltipState } from './types';
 import { NetworkService } from './utils/NetworkService';
-import { ZoomIn, ZoomOut, User, Camera as CameraIcon, SwitchCamera, RotateCcw, BrainCircuit } from 'lucide-react';
+import { queryOpenRouter } from './utils/fallbackService';
+import { ZoomIn, ZoomOut, User, Camera as CameraIcon, SwitchCamera, RotateCcw, BrainCircuit, WifiOff } from 'lucide-react';
 
 type AppState = 'permissions' | 'booting' | 'active';
 
@@ -88,6 +89,34 @@ const CONTROL_HINTS = [
     "\"Включи аватар\""
 ];
 
+// AudioWorklet Processor Code for low-latency audio input
+const AUDIO_WORKLET_CODE = `
+class PCMProcessor extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this.bufferSize = 2048;
+    this.buffer = new Float32Array(this.bufferSize);
+    this.index = 0;
+  }
+
+  process(inputs, outputs, parameters) {
+    const input = inputs[0];
+    if (input && input.length > 0) {
+      const inputChannel = input[0];
+      for (let i = 0; i < inputChannel.length; i++) {
+        this.buffer[this.index++] = inputChannel[i];
+        if (this.index >= this.bufferSize) {
+          this.port.postMessage(this.buffer);
+          this.index = 0;
+        }
+      }
+    }
+    return true;
+  }
+}
+registerProcessor('pcm-processor', PCMProcessor);
+`;
+
 const App: React.FC = () => {
   const [appState, setAppState] = useState<AppState>('permissions');
   const [isVideoActive, setIsVideoActive] = useState(false);
@@ -145,6 +174,10 @@ const App: React.FC = () => {
   
   const zoomTimeoutRef = useRef<any>(null);
 
+  // Fallback Mode State
+  const [isFallbackMode, setIsFallbackMode] = useState(false);
+  const recognitionRef = useRef<any>(null);
+
   // Tooltip State
   const [tooltip, setTooltip] = useState<TooltipState>({ visible: false, text: '', x: 0, y: 0 });
 
@@ -156,6 +189,13 @@ const App: React.FC = () => {
     }, 1000);
     return () => clearInterval(timer);
   }, []);
+
+  // Monitor Scene Updates and Log them
+  useEffect(() => {
+    if (sceneDescription !== 'ОЖИДАНИЕ ДАННЫХ...') {
+        addLog('deduction', `СЦЕНА ОБНОВЛЕНА: ${sceneDescription}`);
+    }
+  }, [sceneDescription]);
 
   // Zoom Auto Reset
   useEffect(() => {
@@ -184,7 +224,7 @@ const App: React.FC = () => {
              if (data === 'ПОДКЛЮЧЕНО') setStatus('СЕТЬ');
              else if (data === 'АВТОНОМНЫЙ РЕЖИМ') {
                  // Do not show ERROR for offline mode, show Ready/Standalone
-                 if (status !== 'СЛЕЖЕНИЕ' && status !== 'АНАЛИЗ') {
+                 if (status !== 'СЛЕЖЕНИЕ' && status !== 'АНАЛИЗ' && status !== 'ОШИБКА' && !isFallbackMode) {
                      setStatus('ГОТОВ');
                  }
                  addLog('net', 'АВТОНОМНЫЙ РЕЖИМ');
@@ -199,7 +239,7 @@ const App: React.FC = () => {
              setRemoteObjects(allRemote);
           }
       });
-  }, []);
+  }, [isFallbackMode]);
 
   useEffect(() => {
       const handleKey = (e: KeyboardEvent) => {
@@ -340,8 +380,53 @@ const App: React.FC = () => {
       }
   };
 
+  // --- Fallback Logic ---
+  const startFallbackMode = () => {
+      if (isFallbackMode) return;
+      setIsFallbackMode(true);
+      setStatus('РЕЗЕРВ');
+      addLog('sys', 'АКТИВАЦИЯ РЕЗЕРВНОГО КАНАЛА (OPENROUTER)');
+      
+      const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+      if (SpeechRecognition) {
+          const recognition = new SpeechRecognition();
+          recognition.lang = 'ru-RU';
+          recognition.continuous = true;
+          recognition.interimResults = false;
+          
+          recognition.onresult = async (event: any) => {
+              const lastResult = event.results[event.results.length - 1];
+              if (lastResult.isFinal) {
+                  const text = lastResult[0].transcript;
+                  addLog('action', `ВЫ: ${text}`);
+                  setHistory(prev => [...prev, { id: Date.now(), text, isAi: false, timestamp: Date.now() }].slice(-10));
+                  
+                  setAvatarAction('LISTENING');
+                  // Query OpenRouter
+                  const response = await queryOpenRouter([{ role: 'user', content: text }]);
+                  
+                  setHistory(prev => [...prev, { id: Date.now(), text: response, isAi: true, timestamp: Date.now() }].slice(-10));
+                  speakSystemMessage(response);
+                  setAvatarAction('TALKING');
+                  setTimeout(() => setAvatarAction('IDLE'), 2000);
+              }
+          };
+          
+          recognition.onerror = () => {
+              // Restart on error if needed or silently fail
+          };
+          
+          recognition.start();
+          recognitionRef.current = recognition;
+      } else {
+          addLog('sys', 'ОШИБКА: НЕТ ПОДДЕРЖКИ RECOGNITION');
+      }
+  };
+
   const connectToGemini = async () => {
-    // Graceful offline check: Don't spam retries if browser is offline
+    // If we are already in fallback mode, don't try to reconnect to Gemini
+    if (isFallbackMode) return;
+
     if (navigator.onLine === false) {
         addLog('net', 'ОФФЛАЙН. ОЖИДАНИЕ СЕТИ...');
         if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
@@ -366,14 +451,16 @@ const App: React.FC = () => {
             tools: [{ functionDeclarations: toolsDeclaration }],
             systemInstruction: `
               ПРОТОКОЛ: ОПЕРАТОР ШЛЕМА.
-              Ты управляешь визуальным интерфейсом для пользователя.
-              ВАЖНО: Сразу после подключения ПОПРИВЕТСТВУЙ оператора голосом и ОПИШИ, что ты видишь, используя updateSceneStatus.
-              1. Если нужно рассмотреть деталь - setZoomInterest.
-              2. Если видишь лицо или объект - annotateRegion.
-              3. Можешь переключать камеры (SWITCH_CAMERA).
-              4. Если пользователь просит выделить что-то (например "выдели человека"), используй selectTarget.
-              5. Описывай кратко, четко, как в радиоэфире.
+              Ты управляешь визуальным интерфейсом для пользователя и видишь видеопоток в РЕАЛЬНОМ ВРЕМЕНИ.
+              ВАЖНО:
+              1. Твоя главная задача - быть активным помощником. НЕ ЖДИ вопросов, если видишь что-то важное или опасное.
+              2. Сразу после подключения ПОПРИВЕТСТВУЙ оператора и ОПИШИ, что ты видишь прямо сейчас.
+              3. Используй 'updateSceneStatus' для обновления текстового статуса.
+              4. Используй 'annotateRegion' если видишь лица или важные объекты.
+              5. Описывай изменения в сцене кратко и четко, как в радиоэфире.
             `,
+            // FIXED: Using empty objects avoids "invalid argument" error. 
+            // The Live API infers the correct transcription model from the main model.
             inputAudioTranscription: {},
             outputAudioTranscription: {} 
         },
@@ -389,7 +476,6 @@ const App: React.FC = () => {
                 addLog('sys', 'GEMINI ПОДКЛЮЧЕН');
                 triggerAvatarAction('WAVE', 2000); 
                 
-                // Force AI to start interacting immediately
                 if (sessionPromiseRef.current) {
                     sessionPromiseRef.current.then(session => {
                         try {
@@ -414,11 +500,9 @@ const App: React.FC = () => {
                                 setSelectedTargetId(null);
                                 addLog('action', 'СБРОС ВЫДЕЛЕНИЯ');
                             } else {
-                                // Logic to select closest matching object
                                 const targetType = args.targetType.toLowerCase();
                                 const candidates = localObjects.filter(o => o.class.includes(targetType) || targetType.includes(o.class));
                                 if (candidates.length > 0) {
-                                    // Pick largest/closest
                                     candidates.sort((a,b) => (b.bbox[2]*b.bbox[3]) - (a.bbox[2]*a.bbox[3]));
                                     setSelectedTargetId(candidates[0].id);
                                     addLog('action', `ЗАХВАТ ЦЕЛИ: ${targetType.toUpperCase()}`);
@@ -456,7 +540,6 @@ const App: React.FC = () => {
                     }
                 }
 
-                // Handle User Transcription
                 if (msg.serverContent?.inputTranscription) {
                    const text = msg.serverContent.inputTranscription.text;
                    if (text) {
@@ -465,7 +548,6 @@ const App: React.FC = () => {
                    }
                 }
 
-                // Handle AI Transcription
                 if (msg.serverContent?.outputTranscription) {
                     const text = msg.serverContent.outputTranscription.text;
                     if (text) {
@@ -473,22 +555,19 @@ const App: React.FC = () => {
                     }
                 }
                 
-                // Turn Complete: Flush buffers to history
                 if (msg.serverContent?.turnComplete) {
                    setStatus('СЛЕЖЕНИЕ');
                    setAvatarAction('IDLE');
                    
                    setHistory(h => {
                        const newHistory = [...h];
-                       // Flush User Buffer if any
                        if (userBuffer.trim()) {
                            newHistory.push({ id: Date.now() - 1, text: userBuffer, isAi: false, timestamp: Date.now() });
                        }
-                       // Flush AI Buffer if any
                        if (aiBuffer.trim()) {
                            newHistory.push({ id: Date.now(), text: aiBuffer, isAi: true, timestamp: Date.now() });
                        }
-                       return newHistory.slice(-10); // Keep last 10
+                       return newHistory.slice(-10);
                    });
                    
                    setUserBuffer('');
@@ -502,27 +581,34 @@ const App: React.FC = () => {
                 }
             },
             onclose: () => {
+                if (isFallbackMode) return;
                 connectedRef.current = false;
-                sessionPromiseRef.current = null; // Prevent sending data
+                sessionPromiseRef.current = null; 
                 setStatus('ГОТОВ'); 
                 addLog('sys', 'GEMINI ОТКЛЮЧЕН');
                 setAvatarAction('REACT_NEG');
+                
+                if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
+                reconnectTimeoutRef.current = setTimeout(() => connectToGemini(), 3000);
             },
             onerror: (err: any) => {
+                if (isFallbackMode) return;
                 connectedRef.current = false;
-                sessionPromiseRef.current = null; // Prevent sending data
+                sessionPromiseRef.current = null;
                 
                 const msg = err.message || String(err);
-                if (msg.includes('Network error') || msg.includes('aborted') || msg.includes('Failed to fetch')) {
-                     addLog('net', 'СВЯЗЬ ПРЕРВАНА. ПОВТОР...');
+                if (msg.includes('400')) {
+                     console.error("Gemini 400 Error - Invalid Config", err);
+                     // 400 means our config is bad, retrying won't help. Switch to fallback.
+                     addLog('sys', 'ОШИБКА КОНФИГУРАЦИИ API. ПЕРЕХОД НА РЕЗЕРВ.');
+                     startFallbackMode();
                 } else {
                      console.error("Live API Error:", err);
                      addLog('sys', `ОШИБКА: ${msg.slice(0, 20)}...`);
+                     setAvatarAction('REACT_NEG');
+                     if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
+                     reconnectTimeoutRef.current = setTimeout(() => connectToGemini(), 5000);
                 }
-
-                setAvatarAction('REACT_NEG');
-                if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
-                reconnectTimeoutRef.current = setTimeout(() => connectToGemini(), 3000); // Auto reconnect attempt
             }
         }
       });
@@ -534,61 +620,70 @@ const App: React.FC = () => {
         console.error("Connection failed", e);
         connectedRef.current = false;
         
-        // RETRY LOGIC
-        addLog('sys', `ОШИБКА СЕТИ (${e.message || '503'}). ПОВТОР...`);
-        if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
-        reconnectTimeoutRef.current = setTimeout(() => connectToGemini(), 5000);
+        // If critical failure, switch to fallback
+        addLog('sys', `СБОЙ GEMINI: ПЕРЕХОД НА РЕЗЕРВ`);
+        startFallbackMode();
     }
   };
 
   const startAudioInput = async () => {
-      // Prevent multiple initialization of audio context which can lead to echo or resource exhaustion
+      // If we are in fallback mode, we use SpeechRecognition, not raw audio streaming
+      if (isFallbackMode) return;
+
       if (inputContextRef.current?.state === 'running' && inputAnalyserRef.current) return;
 
       try {
         const stream = await navigator.mediaDevices.getUserMedia({ 
             audio: { channelCount: 1, sampleRate: 16000 } 
         });
+        
         const inputCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
         inputContextRef.current = inputCtx;
+        
+        // Register AudioWorklet
+        const blob = new Blob([AUDIO_WORKLET_CODE], { type: 'application/javascript' });
+        const workletUrl = URL.createObjectURL(blob);
+        await inputCtx.audioWorklet.addModule(workletUrl);
+
         const source = inputCtx.createMediaStreamSource(stream);
-        const processor = inputCtx.createScriptProcessor(4096, 1, 1);
+        const workletNode = new AudioWorkletNode(inputCtx, 'pcm-processor');
         const analyser = inputCtx.createAnalyser();
         analyser.fftSize = 64; 
         inputAnalyserRef.current = analyser;
-        source.connect(analyser);
-        analyser.connect(processor);
-        processor.connect(inputCtx.destination);
-        
-        processor.onaudioprocess = (e) => {
-            // Optimization: Skip processing if not connected
-            if (!connectedRef.current || !sessionPromiseRef.current) return;
 
-            const inputData = e.inputBuffer.getChannelData(0);
+        source.connect(analyser);
+        analyser.connect(workletNode);
+        workletNode.connect(inputCtx.destination);
+        
+        workletNode.port.onmessage = (e) => {
+            if (!connectedRef.current || !sessionPromiseRef.current || isFallbackMode) return;
+
+            const inputData = e.data; 
             const pcmData = new Int16Array(inputData.length);
             for (let i = 0; i < inputData.length; i++) {
                 const s = Math.max(-1, Math.min(1, inputData[i]));
                 pcmData[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
             }
+            
             let binary = '';
             const bytes = new Uint8Array(pcmData.buffer);
-            for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
+            const len = bytes.byteLength;
+            for (let i = 0; i < len; i++) {
+                binary += String.fromCharCode(bytes[i]);
+            }
             const base64 = btoa(binary);
 
-            // Use sessionPromiseRef to ensure we only send when connected
             sessionPromiseRef.current.then(session => {
                 try {
                     session.sendRealtimeInput({
                         media: { mimeType: 'audio/pcm;rate=16000', data: base64 }
                     });
-                } catch(e) {
-                     // Catch synchronous send errors (like closed socket)
-                }
-            }).catch(e => {
-                // Swallow errors if session is closed/failed, we'll reconnect anyway
-            });
+                } catch(e) {}
+            }).catch(e => {});
         };
+
         if (inputCtx.state === 'suspended') await inputCtx.resume();
+        
       } catch (e) {
           console.error("Audio Input Error", e);
           addLog('sys', 'ОШИБКА МИКРОФОНА');
@@ -622,6 +717,7 @@ const App: React.FC = () => {
       }
   };
 
+  // ... (keeping other handlers same as before: handleDeepAnalysis, handleUpdateLocalObjects, etc.)
   const handleDeepAnalysis = useCallback((object: TrackedObject) => {
       let knownName = knownProfilesRef.current.get(object.id);
       if (!knownName) {
@@ -655,7 +751,7 @@ const App: React.FC = () => {
   }, [selectedTargetId]);
 
   const handleFrameCapture = useCallback((base64: string, quality: number) => {
-      // Use promise ref and connected flag to ensure safe sending
+      if (isFallbackMode) return;
       if (connectedRef.current && sessionPromiseRef.current) {
           sessionPromiseRef.current.then(session => {
               try {
@@ -665,9 +761,8 @@ const App: React.FC = () => {
               } catch(e) {}
           }).catch(e => {});
       }
-  }, []); 
+  }, [isFallbackMode]); 
 
-  // Tooltip Handlers
   const handleMouseEnter = (text: string, e: React.MouseEvent) => {
       setTooltip({ visible: true, text, x: e.clientX, y: e.clientY });
   };
@@ -726,7 +821,7 @@ const App: React.FC = () => {
          aiTranscript={aiBuffer}
          history={history}
          logs={logs}
-         status={status}
+         status={isFallbackMode ? 'РЕЗЕРВ' : status}
          isListening={isListening}
          fps={fps}
          audioAnalyser={inputAnalyserRef.current}
@@ -737,6 +832,14 @@ const App: React.FC = () => {
          showLogs={showLogs}
       />
       
+      {/* Fallback Mode Indicator */}
+      {isFallbackMode && (
+          <div className="absolute top-20 right-4 z-50 text-red-500 font-bold bg-black/80 px-4 py-2 border border-red-500 flex items-center gap-2 animate-pulse">
+              <WifiOff size={16} />
+              <span>РЕЗЕРВНЫЙ КАНАЛ (OPENROUTER)</span>
+          </div>
+      )}
+
       {/* Tooltip Render */}
       {tooltip.visible && (
           <div 

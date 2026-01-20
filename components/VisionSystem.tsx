@@ -3,6 +3,7 @@ import React, { useRef, useEffect, useState, useCallback } from 'react';
 import * as THREE from 'three';
 import { TrackedObject, Vector3, ZoomState, AiAnnotation, AnalysisMode } from '../types';
 import { videoWorkerScript } from '../utils/workerScript';
+import { Cpu, Activity } from 'lucide-react';
 
 interface VisionSystemProps {
   isActive: boolean;
@@ -42,6 +43,14 @@ interface TrackerState {
   hasLidarScan: boolean;
   gesture?: string;
   rotationOffset: number;
+  lastLabelUpdate?: string; 
+  displayDist: number; // Smoothed distance for display
+}
+
+interface LoadingState {
+    active: boolean;
+    progress: number;
+    stage: string;
 }
 
 const getRealWorldHeight = (cls: string): number => {
@@ -52,6 +61,11 @@ const getRealWorldHeight = (cls: string): number => {
         vase: 0.3, hand: 0.20
     };
     return map[cls.toLowerCase()] || 0.5;
+};
+
+// Device capability detection
+const isMobileDevice = () => {
+    return /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
 };
 
 export const VisionSystem: React.FC<VisionSystemProps> = ({
@@ -86,7 +100,7 @@ export const VisionSystem: React.FC<VisionSystemProps> = ({
   const animationFrameRef = useRef<number>();
   const lastCaptureTimeRef = useRef(0);
   const prevSceneDescRef = useRef(sceneDescription);
-  const scanEffectRef = useRef({ active: false, progress: 0 });
+  const [scanActive, setScanActive] = useState(false);
   const streamRef = useRef<MediaStream | null>(null);
   const isLidarAvailableRef = useRef(false);
 
@@ -98,6 +112,9 @@ export const VisionSystem: React.FC<VisionSystemProps> = ({
   const previousFrameDataRef = useRef<Uint8ClampedArray | null>(null);
   const isMovingFastRef = useRef<boolean>(false);
   const motionTimeoutRef = useRef<any>(null);
+
+  // Loading State for Modules
+  const [loadingState, setLoadingState] = useState<LoadingState>({ active: true, progress: 0, stage: 'INIT' });
 
   useEffect(() => {
     if (videoRef.current) {
@@ -113,7 +130,9 @@ export const VisionSystem: React.FC<VisionSystemProps> = ({
   useEffect(() => {
       if (sceneDescription !== prevSceneDescRef.current) {
           prevSceneDescRef.current = sceneDescription;
-          scanEffectRef.current = { active: true, progress: 0 };
+          // Trigger visual scan sweep on analysis change
+          setScanActive(true);
+          setTimeout(() => setScanActive(false), 1000);
       }
   }, [sceneDescription]);
 
@@ -123,29 +142,47 @@ export const VisionSystem: React.FC<VisionSystemProps> = ({
     workerRef.current = worker;
     worker.postMessage({ type: 'load' });
     worker.onmessage = (e) => {
-        const { type, predictions, error, scaleFactor } = e.data;
-        if (type === 'loaded') console.log("AI Worker Loaded");
-        if (type === 'error') console.warn("Worker Error", error);
+        const { type, predictions, error, scaleFactor, progress, stage } = e.data;
+        
+        if (type === 'progress') {
+            setLoadingState({ active: true, progress, stage });
+        }
+        if (type === 'loaded') {
+            console.log("AI Worker Loaded");
+            setLoadingState({ active: false, progress: 100, stage: 'READY' });
+        }
+        if (type === 'error') {
+            console.warn("Worker Error", error);
+            setLoadingState({ active: true, progress: 0, stage: 'ERROR' });
+        }
         if (type === 'result') handleWorkerPredictions(predictions, scaleFactor);
     };
 
     const updateNetworkStats = () => {
+        const isMobile = isMobileDevice();
+        // Adjust processing interval based on device capabilities
+        let baseInterval = isMobile ? 300 : 150; // Slower on mobile to save battery
+
         if (navigator.connection) {
             const down = navigator.connection.downlink; 
             if (down < 2) {
                 networkQualityRef.current = 0.3;
-                processingIntervalRef.current = 500; 
+                processingIntervalRef.current = baseInterval * 2; 
             } else if (down < 5) {
                 networkQualityRef.current = 0.6;
-                processingIntervalRef.current = 300; 
+                processingIntervalRef.current = baseInterval * 1.5; 
             } else {
                 networkQualityRef.current = 0.8;
-                processingIntervalRef.current = 200; 
+                processingIntervalRef.current = baseInterval; 
             }
+        } else {
+            processingIntervalRef.current = baseInterval;
         }
     };
     if (navigator.connection) {
         navigator.connection.addEventListener('change', updateNetworkStats);
+        updateNetworkStats();
+    } else {
         updateNetworkStats();
     }
 
@@ -160,12 +197,20 @@ export const VisionSystem: React.FC<VisionSystemProps> = ({
     const switchCamera = async () => {
         if (!isActive) return;
         try {
-            const newStream = await navigator.mediaDevices.getUserMedia({
-                video: { 
+            const isMobile = isMobileDevice();
+            
+            // Adaptive Constraints based on device
+            const constraints: MediaStreamConstraints = {
+                video: {
                     deviceId: activeDeviceId ? { exact: activeDeviceId } : undefined,
-                    width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 }
+                    width: isMobile ? { ideal: 640 } : { ideal: 1280 }, 
+                    height: isMobile ? { ideal: 480 } : { ideal: 720 },
+                    frameRate: isMobile ? { ideal: 24, max: 30 } : { ideal: 30, max: 60 }
                 }
-            });
+            };
+
+            const newStream = await navigator.mediaDevices.getUserMedia(constraints);
+            
             if (isCancelled) {
                 newStream.getTracks().forEach(t => t.stop());
                 return;
@@ -213,18 +258,6 @@ export const VisionSystem: React.FC<VisionSystemProps> = ({
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     Object.assign(renderer.domElement.style, { position: 'absolute', top: '0', left: '0', pointerEvents: 'none', zIndex: '10' });
     containerRef.current.appendChild(renderer.domElement);
-
-    const pointsGeo = new THREE.BufferGeometry();
-    const pointCount = 200; 
-    const positions = new Float32Array(pointCount * 3);
-    for(let i=0; i<pointCount*3; i++) positions[i] = (Math.random() - 0.5) * 2;
-    pointsGeo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-    const pointsMat = new THREE.PointsMaterial({ color: 0x00FFFF, size: 0.05, transparent: true, opacity: 0.6, blending: THREE.AdditiveBlending });
-    const pointsMesh = new THREE.Points(pointsGeo, pointsMat);
-    pointsMesh.name = "LIDAR_CLOUD";
-    pointsMesh.visible = false;
-    scene.add(pointsMesh);
-    lidarPointsRef.current = pointsMesh;
     
     sceneRef.current = scene;
     cameraRef.current = camera;
@@ -251,7 +284,12 @@ export const VisionSystem: React.FC<VisionSystemProps> = ({
               return;
           }
           const video = videoRef.current;
-          const ANALYSIS_WIDTH = networkQualityRef.current < 0.5 ? 240 : 320;
+          
+          // Adaptive Analysis Resolution: Smaller on mobile for performance
+          const isMobile = isMobileDevice();
+          const qualityMultiplier = networkQualityRef.current < 0.5 ? 0.7 : 1.0;
+          const ANALYSIS_WIDTH = isMobile ? 240 : (320 * qualityMultiplier);
+
           try {
              if (motionTimeoutRef.current) clearTimeout(motionTimeoutRef.current);
              const bitmap = await createImageBitmap(video, { resizeWidth: ANALYSIS_WIDTH, resizeQuality: 'low' });
@@ -262,7 +300,7 @@ export const VisionSystem: React.FC<VisionSystemProps> = ({
           } catch (e) {}
           
           const now = Date.now();
-          if (now - lastCaptureTimeRef.current > 4000 && onFrameCapture) {
+          if (now - lastCaptureTimeRef.current > 1000 && onFrameCapture) {
              const snapCanvas = document.createElement('canvas');
              const scale = networkQualityRef.current; 
              snapCanvas.width = video.videoWidth * scale;
@@ -287,7 +325,6 @@ export const VisionSystem: React.FC<VisionSystemProps> = ({
       renderLoop();
   };
 
-  // Improved: run asynchronously to not block UI
   const checkSceneChange = (currentIds: string[], classes: string[]) => {
       const now = Date.now();
       if (now - lastAnalysisTimeRef.current < 2000) return; 
@@ -332,7 +369,6 @@ export const VisionSystem: React.FC<VisionSystemProps> = ({
 
           if(bestId) {
              const t = trackersRef.current.get(bestId)!;
-             // Smoother lerp for more stability
              const lerpFactor = processingIntervalRef.current > 300 ? 0.5 : 0.4;
              t.lockedBox[0] += (scaledBbox[0] - t.lockedBox[0]) * lerpFactor;
              t.lockedBox[1] += (scaledBbox[1] - t.lockedBox[1]) * lerpFactor;
@@ -341,30 +377,20 @@ export const VisionSystem: React.FC<VisionSystemProps> = ({
              t.lastSeenTime = now;
              t.consecutiveMisses = 0;
              t.gesture = pred.gesture;
-             // FORCE IMMEDIATE OPACITY 1.0
              t.opacity = 1.0;
              
              availableTrackers.delete(bestId);
              activeIds.add(bestId);
-             if (analysisMode === 'DETAILED' && !t.isRemote && !t.scanProgress && onDeepAnalysis && t.class === 'person') {
-                 if (Math.random() > 0.99) {
-                    onDeepAnalysis({
-                        id: t.id, class: t.class, confidence: 1, bbox: t.lockedBox, position3D: t.physics.current, distance: 0, lastSeen: now, gesture: t.gesture
-                    });
-                    // Start progress
-                    t.scanProgress = 0.05;
-                 }
-             }
           } else {
              const newId = nextIdRef.current++;
              const color = pred.class === 'hand' ? 0xFFD700 : 0x00FF00;
              createLabel(newId, pred.class, color);
              trackersRef.current.set(newId, {
                  id: newId, class: pred.class, isRemote: false, color: color, lastSeenTime: now, consecutiveMisses: 0, 
-                 // FIXED: START WITH OPACITY 1.0 - NO FADE IN
                  opacity: 1.0, 
                  lockedBox: scaledBbox as any, physics: { current: {x:0,y:0,z:-10}, target: {x:0,y:0,z:-10}, velocity: {x:0,y:0,z:0}, scale: 0.1 },
-                 scanProgress: 0, hasLidarScan: isLidarAvailableRef.current, gesture: pred.gesture, rotationOffset: Math.random()
+                 scanProgress: 0, hasLidarScan: isLidarAvailableRef.current, gesture: pred.gesture, rotationOffset: Math.random(),
+                 displayDist: 0
              });
              activeIds.add(newId);
           }
@@ -392,19 +418,16 @@ export const VisionSystem: React.FC<VisionSystemProps> = ({
       trackers.forEach(tracker => {
            const calc = calculate3DPosition(tracker.lockedBox, tracker.class, videoW, videoH, width, height);
            tracker.physics.target = { x: calc.x, y: calc.y, z: calc.z };
-           const speed = isMovingFastRef.current ? 0.9 : 0.2; // Slightly snappier physics
+           const speed = isMovingFastRef.current ? 0.9 : 0.2; 
            tracker.physics.current.x += (tracker.physics.target.x - tracker.physics.current.x) * speed;
            tracker.physics.current.y += (tracker.physics.target.y - tracker.physics.current.y) * speed;
            tracker.physics.current.z += (tracker.physics.target.z - tracker.physics.current.z) * speed;
            tracker.rotationOffset += 0.05;
            const isLost = now - tracker.lastSeenTime > 500;
            
-           // Only fade OUT slowly if lost. Instant In is handled in handleWorkerPredictions
            if (isLost) tracker.opacity -= 0.05;
-           
            if (tracker.opacity < 0.05 && isLost) { removeTracker(tracker.id); return; }
            
-           // Update scan progress
            if (tracker.scanProgress > 0 && tracker.scanProgress < 1) {
                tracker.scanProgress += 0.01;
                if(tracker.scanProgress > 1) tracker.scanProgress = 1;
@@ -429,7 +452,6 @@ export const VisionSystem: React.FC<VisionSystemProps> = ({
           if (tracker && g) {
               g.position.set(obj.position3D.x, obj.position3D.y, obj.position3D.z);
               
-              // Target visual components inside the Group
               const bracketGroup = g.getObjectByName('BRACKET');
               const textSprite = g.getObjectByName('TEXT');
               const reticle = g.getObjectByName('RETICLE');
@@ -441,28 +463,35 @@ export const VisionSystem: React.FC<VisionSystemProps> = ({
                   else if (obj.class === 'hand') color = 0xFFD700;
                   else if (isLidarAvailableRef.current) color = 0x00FFFF;
                   
-                  // Update Bracket Color and Opacity
                   bracketGroup.children.forEach((corner: any) => {
                       if(corner.children) {
                           corner.children.forEach((bar: any) => {
                               if(bar.material) {
                                   bar.material.color.setHex(color);
-                                  // Use tracker opacity
                                   bar.material.opacity = (obj.isOccluded ? 0.3 : 1.0) * tracker.opacity;
                               }
                           });
                       }
                   });
                   
-                  // Update Text Opacity
-                  if ((textSprite as any).material) {
-                       (textSprite as any).material.opacity = tracker.opacity;
+                  const spriteMesh = textSprite as THREE.Sprite;
+                  if (spriteMesh.material) {
+                       spriteMesh.material.opacity = tracker.opacity;
                   }
 
                   const dist = Math.abs(obj.position3D.z);
+                  // Smooth distance to prevent jitter in numbers
+                  tracker.displayDist = tracker.displayDist ? tracker.displayDist * 0.9 + dist * 0.1 : dist;
+
                   const scale = Math.max(0.4, dist / 6);
                   g.scale.setScalar(scale); 
-                  updateLabelTexture(textSprite as THREE.Sprite, obj.class, obj.gesture, dist, color);
+                  
+                  // Update label content logic
+                  const contentSig = `${obj.class}-${obj.gesture}-${Math.floor(tracker.displayDist * 10)}`; 
+                  if (tracker.lastLabelUpdate !== contentSig) {
+                       updateLabelTexture(spriteMesh, obj.class, obj.gesture, tracker.displayDist, color);
+                       tracker.lastLabelUpdate = contentSig;
+                  }
               }
 
               if (reticle) {
@@ -476,14 +505,11 @@ export const VisionSystem: React.FC<VisionSystemProps> = ({
                   }
               }
               
-              // Progress Bar Logic
               if (progressGroup) {
                   if (analysisMode === 'DETAILED' && obj.scanProgress && obj.scanProgress > 0 && obj.scanProgress < 1) {
                       progressGroup.visible = true;
                       const fg = progressGroup.getObjectByName('PROGRESS_BAR');
-                      if (fg) {
-                          fg.scale.setX(obj.scanProgress);
-                      }
+                      if (fg) fg.scale.setX(obj.scanProgress);
                   } else {
                       progressGroup.visible = false;
                   }
@@ -542,23 +568,24 @@ export const VisionSystem: React.FC<VisionSystemProps> = ({
   };
 
   const updateLabelTexture = (sprite: THREE.Sprite, cls: string, gesture: string | undefined, distance: number, colorHex: number) => {
-      const canvas = sprite.material.map?.image;
+      const mat = sprite.material as THREE.SpriteMaterial;
+      if (!mat || !mat.map) return;
+      const canvas = mat.map.image as HTMLCanvasElement;
       if (!canvas) return;
+      
       const ctx = canvas.getContext('2d');
       if (!ctx) return;
       ctx.clearRect(0, 0, canvas.width, canvas.height);
       
-      // Sci-fi Label Background (Angled cut)
       ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
       ctx.beginPath();
       ctx.moveTo(0, 40);
       ctx.lineTo(canvas.width - 40, 40);
-      ctx.lineTo(canvas.width, 80); // Cut corner
+      ctx.lineTo(canvas.width, 80); 
       ctx.lineTo(canvas.width, 120);
       ctx.lineTo(0, 120);
       ctx.fill();
       
-      // Accent Line
       ctx.strokeStyle = '#' + colorHex.toString(16).padStart(6, '0');
       ctx.lineWidth = 4;
       ctx.beginPath();
@@ -576,22 +603,20 @@ export const VisionSystem: React.FC<VisionSystemProps> = ({
       if (gesture && gesture !== 'UNKNOWN') text = `[${gesture}]`;
       ctx.fillText(text, 20, 95);
 
-      // Distance
       ctx.font = '30px "Rajdhani", sans-serif';
       ctx.fillStyle = '#AAAAAA';
       ctx.fillText(`DIST: ${distance.toFixed(1)}m`, 20, 115);
 
-      sprite.material.map!.needsUpdate = true;
+      mat.map.needsUpdate = true;
   };
 
   const createLabel = (id: string | number, cls: string, color: number) => {
      const g = new THREE.Group();
      
-     // Corner Brackets
      const bracketGroup = new THREE.Group();
      bracketGroup.name = 'BRACKET';
      const mat = new THREE.MeshBasicMaterial({ color: color, transparent: true, opacity: 1 });
-     const s = 0.5; const len = 0.15; const thick = 0.02;
+     const s = 0.5; const len = 0.2; const thick = 0.03; // Thicker and longer for visibility
 
      const createCorner = (x: number, y: number, xDir: number, yDir: number) => {
          const cGroup = new THREE.Group();
@@ -603,13 +628,12 @@ export const VisionSystem: React.FC<VisionSystemProps> = ({
          return cGroup;
      };
 
-     bracketGroup.add(createCorner(s, s, 1, 1));     // TR
-     bracketGroup.add(createCorner(-s, s, -1, 1));   // TL
-     bracketGroup.add(createCorner(s, -s, 1, -1));   // BR
-     bracketGroup.add(createCorner(-s, -s, -1, -1)); // BL
+     bracketGroup.add(createCorner(s, s, 1, 1));     
+     bracketGroup.add(createCorner(-s, s, -1, 1));   
+     bracketGroup.add(createCorner(s, -s, 1, -1));   
+     bracketGroup.add(createCorner(-s, -s, -1, -1)); 
      g.add(bracketGroup);
 
-     // Reticle
      const reticleGeo = new THREE.RingGeometry(0.6, 0.65, 32);
      const reticleMat = new THREE.MeshBasicMaterial({ color: 0xFF0000, side: THREE.DoubleSide, transparent: true, opacity: 0 });
      const reticle = new THREE.Mesh(reticleGeo, reticleMat);
@@ -617,21 +641,30 @@ export const VisionSystem: React.FC<VisionSystemProps> = ({
      reticle.visible = false;
      g.add(reticle);
 
-     // Text Label
      const canvas = document.createElement('canvas');
-     canvas.width = 512; canvas.height = 160; // Taller for 2 lines
+     canvas.width = 512; canvas.height = 160; 
+     
+     // Pre-render immediately to avoid empty sprite
+     const ctx = canvas.getContext('2d');
+     if(ctx) {
+        ctx.fillStyle = 'rgba(0,0,0,0.5)';
+        ctx.fillRect(0,0,300,80);
+        ctx.fillStyle = '#00FFFF';
+        ctx.font = 'bold 40px sans-serif';
+        ctx.fillText("SCANNING...", 10, 50);
+     }
+
      const texture = new THREE.CanvasTexture(canvas);
-     const spriteMat = new THREE.SpriteMaterial({ map: texture, transparent: true });
+     const spriteMat = new THREE.SpriteMaterial({ map: texture, transparent: true, opacity: 1.0 });
      const sprite = new THREE.Sprite(spriteMat);
      sprite.name = 'TEXT';
      sprite.position.set(0, 0.9, 0); 
      sprite.scale.set(2, 0.625, 1);
      g.add(sprite);
 
-     // Progress Bar
      const progressGroup = new THREE.Group();
      progressGroup.name = 'PROGRESS';
-     progressGroup.position.set(0, -0.7, 0); // Below brackets
+     progressGroup.position.set(0, -0.7, 0); 
      progressGroup.visible = false;
 
      const progressBg = new THREE.Mesh(
@@ -645,7 +678,6 @@ export const VisionSystem: React.FC<VisionSystemProps> = ({
      );
      progressFg.name = 'PROGRESS_BAR';
      progressFg.scale.set(0, 1, 1);
-     // Shift geometry so scaling happens from left to right
      progressFg.geometry.translate(0.5, 0, 0); 
      progressFg.position.set(-0.5, 0, 0.01); 
 
@@ -657,8 +689,6 @@ export const VisionSystem: React.FC<VisionSystemProps> = ({
      sceneRef.current?.add(g);
   };
 
-  // ... (createAiLabel omitted, assumed similar fix or unchanged)
-  
   const createAiLabel = (id: string, label: string) => {
       const g = new THREE.Group();
       const geo = new THREE.BoxGeometry(1.2, 1.2, 1);
@@ -690,8 +720,20 @@ export const VisionSystem: React.FC<VisionSystemProps> = ({
     <div className="absolute inset-0 z-0 bg-transparent overflow-hidden">
       <video ref={videoRef} playsInline muted autoPlay style={{ transition: 'transform 0.5s cubic-bezier(0.2, 0.8, 0.2, 1)', objectFit: 'cover' }} className="absolute inset-0 w-full h-full z-0" />
       <div ref={containerRef} className="absolute inset-0 z-10 pointer-events-none" />
-      {scanEffectRef.current.active && (
-          <div className="absolute inset-0 z-20 pointer-events-none bg-[#00FFFF]/5 animate-pulse mix-blend-overlay"></div>
+      {scanActive && (
+          <div className="absolute inset-0 z-20 pointer-events-none bg-gradient-to-b from-[#00FFFF]/0 via-[#00FFFF]/10 to-[#00FFFF]/0 animate-pulse mix-blend-overlay"></div>
+      )}
+      {/* Module Loading Progress Bar Overlay */}
+      {loadingState.active && (
+          <div className="absolute top-4 left-1/2 -translate-x-1/2 z-50 flex flex-col items-center gap-2 pointer-events-none">
+              <div className="flex items-center gap-2 text-[#00FFFF] bg-black/70 px-4 py-2 rounded border border-[#00FFFF]/30 backdrop-blur-md">
+                 <Cpu size={16} className="animate-pulse" />
+                 <span className="text-xs font-bold tracking-widest">{loadingState.stage} LOADING...</span>
+              </div>
+              <div className="w-64 h-1 bg-gray-800 rounded overflow-hidden">
+                  <div className="h-full bg-[#FF7F00] transition-all duration-300 shadow-[0_0_10px_#FF7F00]" style={{ width: `${loadingState.progress}%` }}></div>
+              </div>
+          </div>
       )}
     </div>
   );

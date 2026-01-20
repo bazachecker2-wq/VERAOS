@@ -10,6 +10,8 @@ export class NetworkService {
   private serverUrl: string = 'ws://localhost:8080';
   private reconnectTimeout: any = null;
   private isExplicitlyClosed: boolean = false;
+  private retryCount: number = 0;
+  private maxRetries: number = 3;
   
   public connectedUsers: ConnectedUser[] = [];
 
@@ -21,21 +23,25 @@ export class NetworkService {
   public connect() {
     this.isExplicitlyClosed = false;
     
-    // Prevent multiple connections
     if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) {
         return;
     }
 
+    // Stop retrying if localhost and max retries reached to avoid console spam
+    if (this.serverUrl.includes('localhost') && this.retryCount >= this.maxRetries) {
+        this.notify('STATUS', 'АВТОНОМНЫЙ РЕЖИМ');
+        return;
+    }
+
     try {
-      // console.log(`[NET] Connecting to ${this.serverUrl}...`); // Silenced
       this.ws = new WebSocket(this.serverUrl);
       
       this.ws.onopen = () => {
         console.log('[NET] Connected');
+        this.retryCount = 0; // Reset retries on success
         this.notify('STATUS', 'ПОДКЛЮЧЕНО');
         this.send('HANDSHAKE', { name: this.userId, status: 'online' });
         
-        // Clear reconnect timer on success
         if (this.reconnectTimeout) {
             clearTimeout(this.reconnectTimeout);
             this.reconnectTimeout = null;
@@ -47,13 +53,13 @@ export class NetworkService {
           const packet: NetworkPacket = JSON.parse(event.data);
           this.handlePacket(packet);
         } catch (e) {
-          // console.error("[NET] Packet parse error", e);
+          // Silently ignore parse errors
         }
       };
 
       this.ws.onerror = (e) => {
-        // Silenced error - this is expected in demo mode without backend
-        // console.warn("[NET] WebSocket Error:", e);
+        // Prevent console error spam by not logging connection refused for localhost
+        // The browser will still log net::ERR_CONNECTION_REFUSED, but we avoid adding extra noise
       };
 
       this.ws.onclose = (e) => {
@@ -72,16 +78,20 @@ export class NetworkService {
   private scheduleReconnect() {
       if (this.reconnectTimeout) return;
       
+      this.retryCount++;
+      const delay = Math.min(5000 * this.retryCount, 30000); // Exponential backoff
+
       this.reconnectTimeout = setTimeout(() => {
           this.reconnectTimeout = null;
           this.connect();
-      }, 5000); // Retry every 5 seconds
+      }, delay);
   }
 
   public setUrl(url: string) {
       this.serverUrl = url;
+      this.retryCount = 0; // Reset retries for new URL
       if (this.ws) {
-          this.ws.close(); // This will trigger onclose -> scheduleReconnect -> connect with new url
+          this.ws.close();
       } else {
           this.connect();
       }
@@ -104,7 +114,7 @@ export class NetworkService {
       try {
         this.ws.send(JSON.stringify(packet));
       } catch (e) {
-          // console.error("[NET] Send failed", e);
+          // Ignore send errors
       }
     }
   }
